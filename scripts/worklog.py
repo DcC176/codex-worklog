@@ -27,9 +27,11 @@ def timestamp(value):
     return parsed
 
 
-def collect(home, day):
+def collect(home, day, until=None):
     start = datetime.combine(day, time(), BEIJING)
-    end = start + timedelta(days=1)
+    end = datetime.combine((until or day) + timedelta(days=1), time(), BEIJING)
+    if end <= start:
+        raise ValueError("End date precedes start date")
     sessions = home / "sessions"
     if not sessions.is_dir():
         raise RuntimeError("Codex sessions directory unavailable; not an empty workday")
@@ -83,7 +85,7 @@ def collect(home, day):
                     text = re.sub(r"<oai-mem-citation>[\s\S]*?</oai-mem-citation>", "", text).strip()
                     if not text.strip():
                         continue
-                    digest = hashlib.sha256((session_id + kind + text.strip()).encode()).hexdigest()
+                    digest = hashlib.sha256((at.astimezone(BEIJING).date().isoformat() + session_id + kind + text.strip()).encode()).hexdigest()
                     if digest in seen:
                         continue
                     seen.add(digest)
@@ -112,7 +114,7 @@ def findings(text):
 
 
 def check(root):
-    paths = [root / "README.md", *(root / "daily").glob("*/*/*.md")]
+    paths = [root / "README.md", *(root / "daily").glob("*/*/*.md"), *(root / "docs").rglob("*.md")]
     errors = []
     for path in paths:
         for issue in findings(path.read_text(encoding="utf-8")):
@@ -127,16 +129,31 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     collector = sub.add_parser("collect")
     collector.add_argument("--date", type=date.fromisoformat, required=True)
-    collector.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
+    collector.add_argument("--until", type=date.fromisoformat, help="Inclusive end date for historical backfill")
+    collector.add_argument("--codex-home", type=Path, action="append", help="Repeat to merge multiple local homes")
     sub.add_parser("index")
     sub.add_parser("check")
     args = parser.parse_args()
     if args.command == "collect":
-        result = collect(args.codex_home, args.date)
-        destination = ROOT / ".local" / f"{args.date}.json"
-        destination.parent.mkdir(exist_ok=True)
-        destination.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Collected {len(result['records'])} records from {result['scanned_files']} files into .local/{args.date}.json (private; do not publish).")
+        homes = args.codex_home or [Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))]
+        results = [collect(home, args.date, args.until) for home in homes]
+        records, seen = {}, set()
+        for result in results:
+            for record in result["records"]:
+                day = record["time"][:10]
+                key = (day, record["session"], record["kind"], record["text"])
+                if key not in seen:
+                    seen.add(key)
+                    records.setdefault(day, []).append(record)
+        day = args.date
+        while day <= (args.until or args.date):
+            key = day.isoformat()
+            result = {"date": key, "timezone": "Asia/Shanghai", "scanned_files": sum(r["scanned_files"] for r in results), "records": sorted(records.get(key, []), key=lambda r: r["time"])}
+            destination = ROOT / ".local" / f"{key}.json"
+            destination.parent.mkdir(exist_ok=True)
+            destination.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"Collected {len(result['records'])} records into .local/{key}.json (private; do not publish).")
+            day += timedelta(days=1)
     elif args.command == "index":
         index(ROOT)
         print("Daily index updated.")

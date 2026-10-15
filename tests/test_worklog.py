@@ -1,9 +1,12 @@
 from datetime import date
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("worklog", Path(__file__).resolve().parents[1] / "scripts" / "worklog.py")
 worklog = importlib.util.module_from_spec(spec)
@@ -11,6 +14,37 @@ spec.loader.exec_module(worklog)
 
 
 class WorklogTests(unittest.TestCase):
+    def test_cli_merges_homes_and_writes_each_date_without_duplicate_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            homes = [root / "current", root / "old"]
+            for home in homes:
+                (home / "sessions").mkdir(parents=True)
+                entries = [{"type": "session_meta", "payload": {"id": "same-session"}}]
+                for at in ("2026-10-13T16:00:00Z", "2026-10-14T16:00:00Z"):
+                    entries.append({"timestamp": at, "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "same result"}})
+                if home == homes[1]:
+                    entries.append({"timestamp": "2026-10-14T10:00:00Z", "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "only in old home"}})
+                (home / "sessions" / "history.jsonl").write_text("\n".join(json.dumps(x) for x in entries), encoding="utf-8")
+            argv = ["worklog", "collect", "--date", "2026-10-14", "--until", "2026-10-15", "--codex-home", str(homes[0]), "--codex-home", str(homes[1])]
+            with patch.object(worklog, "ROOT", root), patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+                worklog.main()
+            first = json.loads((root / ".local" / "2026-10-14.json").read_text(encoding="utf-8"))
+            second = json.loads((root / ".local" / "2026-10-15.json").read_text(encoding="utf-8"))
+            self.assertEqual([r["text"] for r in first["records"]], ["same result", "only in old home"])
+            self.assertEqual([r["text"] for r in second["records"]], ["same result"])
+
+    def test_range_keeps_same_result_on_distinct_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "sessions").mkdir()
+            entries = [{"type": "session_meta", "payload": {"id": "test"}}]
+            for at in ("2026-10-13T16:00:00Z", "2026-10-14T16:00:00Z", "2026-10-15T16:00:00Z"):
+                entries.append({"timestamp": at, "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "same result"}})
+            (home / "sessions" / "old.jsonl").write_text("\n".join(json.dumps(x) for x in entries), encoding="utf-8")
+            result = worklog.collect(home, date(2026, 10, 14), date(2026, 10, 15))
+            self.assertEqual([r["time"][:10] for r in result["records"]], ["2026-10-14", "2026-10-15"])
+
     def test_beijing_boundary_resumed_thread_and_duplicate_results(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
