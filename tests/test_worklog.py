@@ -1,0 +1,70 @@
+from datetime import date
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location("worklog", Path(__file__).resolve().parents[1] / "scripts" / "worklog.py")
+worklog = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worklog)
+
+
+class WorklogTests(unittest.TestCase):
+    def test_beijing_boundary_resumed_thread_and_duplicate_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / "sessions" / "2020" / "01" / "01"
+            sessions.mkdir(parents=True)
+            entries = [{"type": "session_meta", "payload": {"id": "test", "cwd": "project"}}]
+            for at, text in (("2026-10-13T15:59:59Z", "before"), ("2026-10-13T16:00:00Z", "included"), ("2026-10-14T16:00:00Z", "after")):
+                entries.append({"timestamp": at, "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": text}})
+            entries.append({"timestamp": "2026-10-14T10:00:00Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": "final_answer", "content": [{"type": "output_text", "text": "included\n<oai-mem-citation>internal references</oai-mem-citation>"}]}})
+            for filename in ("old-thread.jsonl", "duplicate.jsonl"):
+                (sessions / filename).write_text("\n".join(json.dumps(x) for x in entries), encoding="utf-8")
+            result = worklog.collect(home, date(2026, 10, 14))
+            self.assertEqual([r["text"] for r in result["records"]], ["included"])
+            self.assertEqual(result["scanned_files"], 2)
+
+    def test_subagents_and_tool_output_are_not_daily_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "sessions").mkdir()
+            items = [
+                {"type": "session_meta", "payload": {"source": {"subagent": "worker"}}},
+                {"timestamp": "2026-10-14T10:00:00Z", "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "duplicate work"}},
+            ]
+            (home / "sessions" / "child.jsonl").write_text("\n".join(json.dumps(x) for x in items), encoding="utf-8")
+            self.assertEqual(worklog.collect(home, date(2026, 10, 14))["records"], [])
+
+    def test_unavailable_or_corrupt_sources_fail_instead_of_empty_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with self.assertRaises(RuntimeError):
+                worklog.collect(home, date(2026, 10, 14))
+            (home / "sessions").mkdir()
+            (home / "sessions" / "broken.jsonl").write_text('{"type":"response_item",', encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                worklog.collect(home, date(2026, 10, 14))
+
+    def test_sensitive_patterns_are_blocked_without_echoing_values(self):
+        for sample in ("ghp_" + "a" * 30, "C:/Users/private/file", "name@example.com", "13812345678", "00000000-0000-0000-0000-000000000000"):
+            self.assertTrue(worklog.findings(sample))
+        self.assertEqual(worklog.findings("完成日志整理，实际运行验收尚未进行。"), [])
+
+    def test_index_rebuild_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("# Log\n<!-- daily-index:start -->\n<!-- daily-index:end -->\n", encoding="utf-8")
+            day = root / "daily" / "2026" / "10"
+            day.mkdir(parents=True)
+            (day / "2026-10-14.md").write_text("summary", encoding="utf-8")
+            worklog.index(root)
+            once = (root / "README.md").read_bytes()
+            worklog.index(root)
+            self.assertEqual(once, (root / "README.md").read_bytes())
+            self.assertIn(b"daily/2026/10/2026-10-14.md", once)
+
+
+if __name__ == "__main__":
+    unittest.main()
