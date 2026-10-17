@@ -89,8 +89,63 @@ def collect(home, day, until=None):
                     if digest in seen:
                         continue
                     seen.add(digest)
-                    records.append({"time": at.astimezone(BEIJING).isoformat(), "session": session_id, "project": project, "kind": kind, "text": text})
+                    records.append({"time": at.astimezone(BEIJING).isoformat(), "session": session_id, "project": project, "source": "codex", "kind": kind, "text": text})
     records.sort(key=lambda record: record["time"])
+    return {"date": day.isoformat(), "timezone": "Asia/Shanghai", "scanned_files": scanned, "records": records}
+
+
+def collect_workbuddy(home, day, until=None):
+    start = datetime.combine(day, time(), BEIJING)
+    end = datetime.combine((until or day) + timedelta(days=1), time(), BEIJING)
+    if end <= start:
+        raise ValueError("End date precedes start date")
+    projects = home / "projects"
+    if not projects.is_dir():
+        raise RuntimeError("WorkBuddy projects directory unavailable; not an empty workday")
+    requests, notes, seen, scanned = [], {}, set(), 0
+    # Main conversations live directly inside each project; exclude subagents.
+    for path in sorted(projects.glob("*/*.jsonl")):
+        if path.stat().st_mtime < start.timestamp():
+            continue
+        scanned += 1
+        current_request = ""
+        with path.open(encoding="utf-8") as source:
+            for line_number, line in enumerate(source, 1):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"Incomplete/unreadable WorkBuddy JSONL at {path.name}:{line_number}") from None
+                if item.get("type") != "message":
+                    continue
+                role = item.get("role")
+                if role == "user":
+                    current_request = item.get("id", "")
+                at = datetime.fromtimestamp(item["timestamp"] / 1000, timezone.utc).astimezone(BEIJING)
+                if not start <= at < end:
+                    continue
+                status = item.get("status")
+                if role != "user" and not (role == "assistant" and status in ("completed", "incomplete")):
+                    continue
+                text = "\n".join(c.get("text", "") for c in item.get("content", []) if c.get("type") in ("input_text", "output_text")).strip()
+                if not text or text.lstrip().startswith(("<analysis>", "<think>")):
+                    continue
+                record = {"time": at.isoformat(), "session": item.get("sessionId") or path.stem, "project": item.get("cwd", ""), "source": "workbuddy", "kind": "request_only" if role == "user" else "assistant_note", "text": text}
+                if role == "user":
+                    key = (record["time"][:10], record["session"], text)
+                    if key not in seen:
+                        seen.add(key)
+                        requests.append(record)
+                else:
+                    # completed describes a message, not task acceptance. Keep
+                    # the last note per request/day, and retain incomplete notes.
+                    request = item.get("providerData", {}).get("conversationRequestId") or current_request
+                    key = (record["time"][:10], record["session"], request, status)
+                    record["message_status"] = status
+                    if key not in notes or record["time"] >= notes[key]["time"]:
+                        notes[key] = record
+    records = sorted(requests + list(notes.values()), key=lambda r: r["time"])
     return {"date": day.isoformat(), "timezone": "Asia/Shanghai", "scanned_files": scanned, "records": records}
 
 
@@ -131,17 +186,19 @@ def main():
     collector.add_argument("--date", type=date.fromisoformat, required=True)
     collector.add_argument("--until", type=date.fromisoformat, help="Inclusive end date for historical backfill")
     collector.add_argument("--codex-home", type=Path, action="append", help="Repeat to merge multiple local homes")
+    collector.add_argument("--workbuddy-home", type=Path, action="append", help="WorkBuddy home with projects; repeat for older homes")
     sub.add_parser("index")
     sub.add_parser("check")
     args = parser.parse_args()
     if args.command == "collect":
         homes = args.codex_home or [Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))]
         results = [collect(home, args.date, args.until) for home in homes]
+        results.extend(collect_workbuddy(home, args.date, args.until) for home in (args.workbuddy_home or []))
         records, seen = {}, set()
         for result in results:
             for record in result["records"]:
                 day = record["time"][:10]
-                key = (day, record["session"], record["kind"], record["text"])
+                key = (day, record["source"], record["session"], record["kind"], record["text"])
                 if key not in seen:
                     seen.add(key)
                     records.setdefault(day, []).append(record)

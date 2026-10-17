@@ -14,6 +14,44 @@ spec.loader.exec_module(worklog)
 
 
 class WorklogTests(unittest.TestCase):
+    def test_workbuddy_groups_notes_by_request_day_and_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "projects" / "example"
+            project.mkdir(parents=True)
+            def message(at, role, text, status=None, request="turn"):
+                return {"id": text, "type": "message", "sessionId": "session", "timestamp": int(worklog.timestamp(at).timestamp() * 1000), "role": role, "status": status, "providerData": {"conversationRequestId": request}, "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}]}
+            entries = [
+                message("2026-10-13T15:59:59Z", "user", "before"),
+                message("2026-10-13T16:00:00Z", "user", "request"),
+                message("2026-10-14T01:00:00Z", "assistant", "progress", "completed"),
+                {"type": "reasoning", "timestamp": 1791939600000, "content": "private reasoning"},
+                message("2026-10-14T02:00:00Z", "assistant", "delivery reported", "completed"),
+                message("2026-10-14T03:00:00Z", "assistant", "interrupted", "incomplete"),
+                message("2026-10-14T03:30:00Z", "assistant", "<analysis>private thoughts</analysis>", "completed"),
+                message("2026-10-14T16:00:00Z", "assistant", "next day", "completed"),
+            ]
+            payload = "\n".join(json.dumps(x) for x in entries)
+            (project / "session.jsonl").write_text(payload, encoding="utf-8")
+            (project / "session" / "subagents").mkdir(parents=True)
+            (project / "session" / "subagents" / "child.jsonl").write_text(payload, encoding="utf-8")
+            result = worklog.collect_workbuddy(home, date(2026, 10, 14), date(2026, 10, 15))
+            self.assertEqual([r["text"] for r in result["records"]], ["request", "delivery reported", "interrupted", "next day"])
+            self.assertEqual(result["scanned_files"], 1)
+            self.assertEqual(result["records"][1]["kind"], "assistant_note")
+            self.assertTrue(all(r["source"] == "workbuddy" for r in result["records"]))
+
+    def test_workbuddy_missing_or_corrupt_source_is_not_an_empty_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with self.assertRaises(RuntimeError):
+                worklog.collect_workbuddy(home, date(2026, 10, 14))
+            project = home / "projects" / "example"
+            project.mkdir(parents=True)
+            (project / "bad.jsonl").write_text('{"type":"message",', encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                worklog.collect_workbuddy(home, date(2026, 10, 14))
+
     def test_cli_merges_homes_and_writes_each_date_without_duplicate_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -27,11 +65,18 @@ class WorklogTests(unittest.TestCase):
                     entries.append({"timestamp": "2026-10-14T10:00:00Z", "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "only in old home"}})
                 (home / "sessions" / "history.jsonl").write_text("\n".join(json.dumps(x) for x in entries), encoding="utf-8")
             argv = ["worklog", "collect", "--date", "2026-10-14", "--until", "2026-10-15", "--codex-home", str(homes[0]), "--codex-home", str(homes[1])]
+            for name in ("workbuddy", "workbuddy-old"):
+                buddy = root / name / "projects" / "example"
+                buddy.mkdir(parents=True)
+                note = {"type": "message", "sessionId": "same-session", "timestamp": int(worklog.timestamp("2026-10-14T10:30:00Z").timestamp() * 1000), "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "same result"}]}
+                (buddy / "session.jsonl").write_text(json.dumps(note), encoding="utf-8")
+                argv.extend(["--workbuddy-home", str(root / name)])
             with patch.object(worklog, "ROOT", root), patch("sys.argv", argv), redirect_stdout(io.StringIO()):
                 worklog.main()
             first = json.loads((root / ".local" / "2026-10-14.json").read_text(encoding="utf-8"))
             second = json.loads((root / ".local" / "2026-10-15.json").read_text(encoding="utf-8"))
-            self.assertEqual([r["text"] for r in first["records"]], ["same result", "only in old home"])
+            self.assertEqual([r["text"] for r in first["records"]], ["same result", "only in old home", "same result"])
+            self.assertEqual([r["source"] for r in first["records"]], ["codex", "codex", "workbuddy"])
             self.assertEqual([r["text"] for r in second["records"]], ["same result"])
 
     def test_range_keeps_same_result_on_distinct_days(self):
